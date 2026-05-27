@@ -16,6 +16,7 @@ from src.utils import dict_to_namespace, namespace_to_dict
 from src.analysis.visualization_utils import mols_to_pdbfile, mol_as_pdb
 from src.data.data_utils import TensorDict, Residues
 from src.data.postprocessing import process_all
+from src.model.ema import EMACallback
 from src.model.lightning import DrugFlow
 from src.sbdd_metrics.evaluation import compute_all_metrics_drugflow
 
@@ -53,6 +54,20 @@ def sample(cfg, model_params, samples_dir, job_id=0, n_jobs=1):
     print('Sampling...')
     model = DrugFlow.load_from_checkpoint(cfg.checkpoint, map_location=cfg.device, strict=False,
                                           **model_params)
+
+    if getattr(cfg, 'apply_ema', False):
+        ckpt = torch.load(cfg.checkpoint, map_location='cpu')
+        cb_states = ckpt.get('callbacks', {}) or {}
+        ema_key = next((k for k in cb_states if 'EMACallback' in k), None)
+        if ema_key is None or cb_states[ema_key].get('shadow') is None:
+            print('apply_ema=True but no EMA shadow weights found in checkpoint; using live weights.')
+        else:
+            state = cb_states[ema_key]
+            dummy = EMACallback(decay=state.get('decay', 0.0))
+            dummy.load_state_dict(state)
+            dummy._swap_in(model)
+            print(f'Applied EMA shadow weights from "{ema_key}"')
+
     model.setup(stage='fit' if cfg.set == 'train' else cfg.set)
     model.eval().to(cfg.device)
 
@@ -115,7 +130,7 @@ def evaluate(cfg, model_params, samples_dir):
         reduce_path=cfg.reduce,
         reference_smiles_path=Path(model_params['train_params'].datadir, 'train_smiles.npy'),
         n_samples=cfg.n_samples,
-        exclude_evaluators=[] if cfg.exclude_evaluators is None else cfg.exclude_evaluators,
+        exclude_evaluators=getattr(cfg, 'exclude_evaluators', None) or [],
     )
     with open(Path(samples_dir, 'metrics_data.pkl'), 'wb') as f: 
         pickle.dump(data, f)

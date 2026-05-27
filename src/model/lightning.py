@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch.distributions.categorical import Categorical
 import pytorch_lightning as pl
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_mean, scatter_add
 
 import src.utils as utils
 from src.constants import atom_encoder, atom_decoder, aa_encoder, aa_decoder, \
@@ -27,6 +27,7 @@ from src.model.flows import CoordICFM, TorusICFM, CoordICFMPredictFinal, TorusIC
 from src.model.markov_bridge import UniformPriorMarkovBridge, MarginalPriorMarkovBridge
 from src.model.dynamics import Dynamics
 from src.model.dynamics_hetero import DynamicsHetero
+from src.model.gvp import GVP
 from src.model.diffusion_utils import DistributionNodes
 from src.model.loss_utils import TimestepWeights, clash_loss
 from src.analysis.visualization_utils import pocket_to_rdkit, mols_to_pdbfile
@@ -47,6 +48,25 @@ aa_atom_type_tensor = torch.tensor([[atom_encoder.get(aa_atom_decoder[aa].get(i,
 def set_default(namespace, key, default_val):
     val = vars(namespace).get(key, default_val)
     setattr(namespace, key, val)
+
+
+class _ChannelLinearVec(torch.nn.Module):
+    """SO(3)-equivariant channel-only linear over GVP-style vector features.
+
+    Takes (s, v) to match the GVP call signature; ignores `s`. Applies a
+    single `Linear(vi, vo)` along the channel axis of `v`, leaving the 3
+    spatial components untouched. Returns (None, v_out) with v_out shaped
+    [N, vo, 3] so downstream code can treat it the same as a GVP output.
+    """
+
+    def __init__(self, vi, vo):
+        super().__init__()
+        self.lin = torch.nn.Linear(vi, vo, bias=False)
+
+    def forward(self, sv):
+        _, v = sv                           # v: [N, vi, 3]
+        out = self.lin(v.transpose(-1, -2))  # [N, 3, vo]
+        return None, out.transpose(-1, -2)   # [N, vo, 3]
 
 
 class DrugFlow(pl.LightningModule):
@@ -125,6 +145,11 @@ class DrugFlow(pl.LightningModule):
         # Training parameters
         self.datadir = train_params.datadir
         self.receptor_dir = train_params.datadir
+        # Optional `train_params.dataset_suffix: '.with_uma'` switches the
+        # loader to `{stage}.with_uma.pt`. The `.with_uma` files include
+        # `complex_id` for direct embedding-path lookup; legacy `{stage}.pt`
+        # files don't. Default empty string preserves the old behaviour.
+        self.dataset_suffix = getattr(train_params, 'dataset_suffix', '')
         self.batch_size = train_params.batch_size
         self.lr = train_params.lr
         self.lr_step_size = train_params.lr_step_size
@@ -142,6 +167,11 @@ class DrugFlow(pl.LightningModule):
         self.outdir = eval_params.outdir
         self.eval_batch_size = eval_params.eval_batch_size
         self.eval_epochs = eval_params.eval_epochs
+        # Skip the expensive sampling + analyze_sample branch in Lightning's
+        # validation hooks. When set to True in-training validation
+        # only logs the loss; DPO overrides to False to keep full validation.
+        # DrugFlow defaults to False for backward compatibility with older checkpoints that don't have this flag saved.
+        self.skip_val_sampling = getattr(eval_params, 'skip_val_sampling', False)
         # assert eval_params.visualize_sample_epoch % self.eval_epochs == 0
         self.visualize_sample_epoch = eval_params.visualize_sample_epoch
         self.visualize_chain_epoch = eval_params.visualize_chain_epoch
@@ -225,6 +255,98 @@ class DrugFlow(pl.LightningModule):
         else:
             self.timestep_weights = None
 
+        # REPA (Representation Alignment)
+        # parses loss_params for REPA-related parameters, and initializes projector networks if REPA is enabled
+        self.rep_alignment = getattr(loss_params, 'rep_alignment', False)
+        if self.rep_alignment:
+            self.lambda_repa = loss_params.lambda_repa
+            self.align_depth = loss_params.align_depth
+            d_rep = loss_params.d_rep
+            self.embeddings_dir = getattr(loss_params, 'embeddings_dir', None)
+            self.embedding_type = getattr(loss_params, 'embedding_type', 'ligand_invariant_embedding')
+            self.embedding_key = getattr(loss_params, 'embedding_key', 'combined')
+            node_h_scalar = predictor_params.gvp_params.node_h_dim[0]
+            # Pool only the side(s) of the graph that match the embedding target
+            if self.embedding_type == 'invariant_complex_embedding':
+                projector_input = node_h_scalar * 2  # ligand + pocket concatenated
+            else:  # ligand_invariant_embedding or pocket_embedding
+                projector_input = node_h_scalar
+            projector_hidden = getattr(loss_params, 'projector_dim', projector_input)
+            projector_style = getattr(loss_params, 'projector_style', 'mlp')
+            projector_bn = getattr(loss_params, 'projector_bn', False)
+
+            def _make_scalar_projector():
+                if projector_style == 'mlp':
+                    body = torch.nn.Sequential(
+                        torch.nn.Linear(projector_input, projector_hidden, bias=True),
+                        torch.nn.SiLU(),
+                        torch.nn.Linear(projector_hidden, projector_hidden, bias=True),
+                        torch.nn.SiLU(),
+                        torch.nn.Linear(projector_hidden, d_rep, bias=True),
+                    )
+                elif projector_style == 'linear':
+                    body = torch.nn.Linear(projector_input, d_rep)
+                else:
+                    raise ValueError(
+                        f"Unknown projector_style '{projector_style}'. "
+                        f"Expected 'mlp' or 'linear'."
+                    )
+                if projector_bn:
+                    # Per-channel BN over the flat [N, projector_input] feature
+                    # tensor. Stabilizes the scalar projector's input scale —
+                    # L=0-only (vector features skip this).
+                    return torch.nn.Sequential(
+                        torch.nn.BatchNorm1d(projector_input),
+                        body,
+                    )
+                return body
+
+            self.repa_projectors = torch.nn.ModuleList(
+                [_make_scalar_projector() for _ in range(len(self.align_depth))]
+            )
+
+            # L=1 (vector) alignment. Off by default; turned on by setting
+            # lambda_repa_vec > 0 in the config AND selecting an embedding_key
+            # that ships L=1 targets (e.g. 'l0_l1'). UMA's equivariant features
+            # are load-bearing (forces train them directly), so the projector
+            # uses a GVP block with vector gating — scalar-modulated vector
+            # magnitudes, still SO(3)-equivariant. Matches the (scalar, vector)
+            # language the denoiser already speaks.
+            # Diagnostic probe: when True, `compute_loss` logs projector-output
+            # norms, target norms, and cosine distributions for the first
+            # aligned layer. Gated because the extra .mean()/.std() calls add
+            # per-step overhead and clutter wandb with N extra metrics.
+            self.repa_debug = getattr(loss_params, 'repa_debug', False)
+            self.lambda_repa_vec = getattr(loss_params, 'lambda_repa_vec', 0.0)
+            # Optional second L=1 term: per-channel-norm MSE alongside the
+            # cosine. Cosine is scale-invariant, so this is what makes the
+            # projector reproduce UMA's L=1 magnitude (vector "intensity"),
+            # not just direction. 0 disables; the cosine knob above and this
+            # one are independent.
+            self.lambda_repa_vec_mag = getattr(loss_params, 'lambda_repa_vec_mag', 0.0)
+            if self.lambda_repa_vec > 0 or self.lambda_repa_vec_mag > 0:
+                d_rep_vec = getattr(loss_params, 'd_rep_vec', d_rep)
+                node_h_vec = predictor_params.gvp_params.node_h_dim[1]
+                projector_vec_style = getattr(loss_params, 'projector_vec_style', 'gvp')
+
+                def _make_vec_projector():
+                    if projector_vec_style == 'gvp':
+                        return GVP(
+                            in_dims=(node_h_scalar, node_h_vec),
+                            out_dims=(node_h_scalar, d_rep_vec),
+                            activations=(None, None),
+                            vector_gate=True,
+                        )
+                    if projector_vec_style == 'linear':
+                        return _ChannelLinearVec(node_h_vec, d_rep_vec)
+                    raise ValueError(
+                        f"Unknown projector_vec_style '{projector_vec_style}'. "
+                        f"Expected 'gvp' or 'linear'."
+                    )
+
+                self.repa_projectors_vec = torch.nn.ModuleList(
+                    [_make_vec_projector() for _ in range(len(self.align_depth))]
+                )
 
         # Sampling
         self.T_sampling = eval_params.n_sampling_steps
@@ -341,8 +463,9 @@ class DrugFlow(pl.LightningModule):
         return torch.zeros(len(encoder)) * float("nan") if hist is None else torch.tensor(hist.p)
 
     def configure_optimizers(self):
+        trainable = [p for p in self.parameters() if p.requires_grad]
         optimizers = [
-            torch.optim.AdamW(self.parameters(), lr=self.lr, amsgrad=True, weight_decay=1e-12),
+            torch.optim.AdamW(trainable, lr=self.lr, amsgrad=True, weight_decay=1e-12),
         ]
 
         if self.lr_step_size is None or self.lr_gamma is None:
@@ -384,6 +507,19 @@ class DrugFlow(pl.LightningModule):
         # we want to know if something goes wrong on the validation or test set
         catch_errors = stage == "train"
 
+        # Resolve embeddings directory for REPA (per-complex .pt files).
+        # REPA targets are only consumed by compute_loss (training_step +
+        # validation_step). The test stage goes through model.sample() and
+        # never computes loss, so loading embeddings there is wasted work
+        # and breaks OOD eval where the embedding dir doesn't exist.
+        embeddings_dir = None
+        embedding_type = 'ligand_invariant_embedding'
+        embedding_key = None
+        if self.rep_alignment and self.embeddings_dir is not None and stage != "test":
+            embeddings_dir = self.embeddings_dir
+            embedding_type = self.embedding_type
+            embedding_key = self.embedding_key
+
         if self.sharded_dataset:
             return get_wds(
                 data_path=self.datadir,
@@ -394,17 +530,31 @@ class DrugFlow(pl.LightningModule):
 
         if self.sample_from_clusters and stage == "train":  # val/test should be deterministic
             return ClusteredDataset(
-                pt_path=Path(self.datadir, 'val.pt' if self.debug else f'{stage}.pt'),
+                pt_path=Path(
+                self.datadir,
+                f'val{self.dataset_suffix}.pt' if self.debug
+                else f'{stage}{self.dataset_suffix}.pt',
+            ),
                 ligand_transform=ligand_transform,
                 pocket_transform=pocket_transform,
-                catch_errors=catch_errors
+                catch_errors=catch_errors,
+                embeddings_dir=embeddings_dir,
+                embedding_type=embedding_type,
+                embedding_key=embedding_key,
             )
 
         return ProcessedLigandPocketDataset(
-            pt_path=Path(self.datadir, 'val.pt' if self.debug else f'{stage}.pt'),
+            pt_path=Path(
+                self.datadir,
+                f'val{self.dataset_suffix}.pt' if self.debug
+                else f'{stage}{self.dataset_suffix}.pt',
+            ),
             ligand_transform=ligand_transform,
             pocket_transform=pocket_transform,
-            catch_errors=catch_errors
+            catch_errors=catch_errors,
+            embeddings_dir=embeddings_dir,
+            embedding_type=embedding_type,
+            embedding_key=embedding_key,
         )
 
     def setup_sampling(self):
@@ -520,7 +670,7 @@ class DrugFlow(pl.LightningModule):
 
         return sc_transform
 
-    def compute_loss(self, ligand, pocket, return_info=False):
+    def compute_loss(self, ligand, pocket, return_info=False, embedding=None):
         """
         Samples time steps and computes network predictions
         """
@@ -578,10 +728,15 @@ class DrugFlow(pl.LightningModule):
         # Predict denoising
         sc_transform = self.get_sc_transform_fn(zt_chi, zt_x, t, z0_chi, ligand['mask'], pocket)
         # sc_transform = None
-        pred_ligand, pred_residues = self.dynamics(
+        dynamics_result = self.dynamics(
             zt_x, zt_h, ligand['mask'], pocket, t,
-            bonds_ligand=(ligand['bonds'], zt_e), sc_transform=sc_transform
+            bonds_ligand=(ligand['bonds'], zt_e), sc_transform=sc_transform,
+            return_intermediates=self.rep_alignment
         )
+        if self.rep_alignment:
+            pred_ligand, pred_residues, intermediates = dynamics_result
+        else:
+            pred_ligand, pred_residues = dynamics_result
 
         # Compute L2 loss
         if self.predict_confidence:
@@ -643,6 +798,220 @@ class DrugFlow(pl.LightningModule):
                                     pocket_coord, pocket_types, pocket_mask)
             loss = loss + self.lambda_clash * loss_clash
 
+        # Save diffusion loss before adding REPA
+        loss_diffusion = loss
+        # REPA loss
+        repa_loss = None
+        repa_loss_vec = None
+        repa_loss_vec_mag = None
+        repa_debug_info = {}
+        if self.rep_alignment and embedding is not None:
+            repa_loss = 0.
+            atom_level = self.embedding_type in ProcessedLigandPocketDataset.ATOM_EMBEDDING_TYPES
+            batch_size = loss.shape[0]
+
+            # Dict embedding → L=0 + L=1 targets (atom-level, e.g. 'l0_l1').
+            # Tensor embedding → existing L=0-only path.
+            if isinstance(embedding, dict):
+                raw_l0 = embedding['l0']
+                z_rep_l1 = embedding['l1']                       # [N_real_total, 3, C]
+            else:
+                raw_l0 = embedding
+                z_rep_l1 = None
+            z_rep_l0 = torch.nn.functional.normalize(raw_l0, dim=-1)
+            # Either L=1 knob (cosine direction or per-channel-norm MSE)
+            # activates the vector branch; both reuse the same projector.
+            vec_on = (z_rep_l1 is not None
+                      and (getattr(self, 'lambda_repa_vec', 0.0) > 0
+                           or getattr(self, 'lambda_repa_vec_mag', 0.0) > 0)
+                      and self.embedding_type == 'atom_ligand')
+            if vec_on:
+                if self.lambda_repa_vec > 0:
+                    repa_loss_vec = 0.
+                if self.lambda_repa_vec_mag > 0:
+                    repa_loss_vec_mag = 0.
+
+            # UMA embeds the real ligand only. Graph-level: zero out virtual
+            # ligand nodes via `real_w` so they don't bias the pooled source
+            # vector. Atom-level: slice them out so per-atom rows line up with
+            # `z_rep` (collate_fn concatenates atom embeddings in sample order).
+            virt = ligand.get('virtual_mask', None)
+            if atom_level or virt is None:
+                real_w = None
+            else:
+                lig_scalar0 = intermediates[0]['ligand']['scalar']
+                real_w = (~virt).to(lig_scalar0.dtype).unsqueeze(-1)
+
+            aligned_idx = 0
+            for layer_idx, layer_feats in enumerate(intermediates):
+                if layer_idx not in self.align_depth:
+                    continue
+
+                lig_s = layer_feats['ligand']['scalar']
+                poc_s = layer_feats['pocket']['scalar']
+
+                if atom_level:
+                    if self.embedding_type == 'atom_ligand':
+                        feats = lig_s
+                        feats_v = layer_feats['ligand']['vector'] if vec_on else None
+                        mask = ligand['mask']
+                        if virt is not None:
+                            keep = ~virt
+                            feats = feats[keep]
+                            if feats_v is not None:
+                                feats_v = feats_v[keep]
+                            mask = mask[keep]
+                    elif self.embedding_type == 'atom_pocket':
+                        feats = poc_s
+                        feats_v = None
+                        mask = pocket['mask']
+                    else:
+                        raise NotImplementedError(
+                            f"Atom-level embedding_type '{self.embedding_type}' "
+                            f"is not wired up yet (pocket+ligand concat needs "
+                            f"per-sample split metadata in the batch)."
+                        )
+                    z_proj_raw = self.repa_projectors[aligned_idx](feats)
+                    z_proj = torch.nn.functional.normalize(z_proj_raw, dim=-1)
+                    per_atom = -(z_proj * z_rep_l0).sum(dim=-1)
+                    repa_loss += scatter_mean(per_atom, mask, dim=0,
+                                              dim_size=batch_size)
+
+                    if self.repa_debug and aligned_idx == 0:
+                        with torch.no_grad():
+                            zp_norm = z_proj_raw.norm(dim=-1)
+                            zr_norm = raw_l0.norm(dim=-1)
+                            repa_debug_info.update({
+                                'dbg_zproj_norm_mean': zp_norm.mean().item(),
+                                'dbg_zproj_norm_std': zp_norm.std().item(),
+                                'dbg_zrep_norm_mean': zr_norm.mean().item(),
+                                'dbg_zrep_norm_std': zr_norm.std().item(),
+                                'dbg_cos_mean': (-per_atom).mean().item(),
+                                'dbg_cos_std': (-per_atom).std().item(),
+                            })
+
+                        # Gradient-norm probe: measure how much each loss
+                        # term pushes the denoiser's scalar intermediate at
+                        # this aligned layer.
+                        if lig_s.requires_grad:
+                            layer_repa = scatter_mean(
+                                per_atom, mask, dim=0, dim_size=batch_size
+                            ).sum()
+
+                            def _gnorm(out):
+                                g = torch.autograd.grad(
+                                    out, lig_s,
+                                    retain_graph=True, allow_unused=True,
+                                )[0]
+                                return g.norm().item() if g is not None else None
+
+                            g_x_n = _gnorm(loss_x.sum())
+                            g_h_n = _gnorm(loss_h.sum())
+                            g_e_n = _gnorm(loss_e.sum())
+                            g_r_n = _gnorm(layer_repa)
+
+                            # Effective main-task gradient at lig_s — single
+                            # backward through the weighted sum gets signed
+                            # cancellation right (not the triangle-inequality
+                            # upper bound of ||Σ λ_i g_i||).
+                            main_w = (
+                                self.lambda_x * loss_x.sum()
+                                + self.lambda_h * loss_h.sum()
+                                + self.lambda_e * loss_e.sum()
+                            )
+                            g_main_n = _gnorm(main_w)
+
+                            # Effective REPA push here = λ_repa / n_aligned × raw.
+                            n_aligned = max(len(self.align_depth), 1)
+                            for k, v in (
+                                ('dbg_grad_norm_x', g_x_n),
+                                ('dbg_grad_norm_h', g_h_n),
+                                ('dbg_grad_norm_e', g_e_n),
+                                ('dbg_grad_norm_repa', g_r_n),
+                                ('dbg_grad_norm_main_weighted', g_main_n),
+                            ):
+                                if v is not None:
+                                    repa_debug_info[k] = v
+                            if g_x_n is not None and g_r_n is not None:
+                                repa_debug_info['dbg_grad_ratio_repa_over_x'] = g_r_n / max(g_x_n, 1e-9)
+                            if g_main_n is not None and g_r_n is not None:
+                                eff_r = (self.lambda_repa / n_aligned) * g_r_n
+                                repa_debug_info['dbg_grad_ratio_repa_over_main'] = eff_r / max(g_main_n, 1e-9)
+
+                    if feats_v is not None:
+                        # GVP projector takes (scalar [N, si], vector [N, vi, 3])
+                        # and returns (s_out, v_out) where v_out has shape
+                        # [N, d_rep_vec, 3]. Scalars are only a gate signal here
+                        # — we discard the scalar output. Transpose the vector
+                        # output to [N, 3, d_rep_vec] so the spatial axis lines
+                        # up with UMA's L=1 target (already in Cartesian).
+                        _, v_proj = self.repa_projectors_vec[aligned_idx]((feats, feats_v))
+                        v_proj = v_proj.transpose(-1, -2)
+                        if repa_loss_vec is not None:
+                            a = v_proj.flatten(-2)
+                            b = z_rep_l1.flatten(-2)
+                            # Rotation-invariant: cosine of flattened (spatial,
+                            # channel) vectors is preserved under a global rotation
+                            # because both sides rotate identically on the spatial
+                            # axis, and rotation preserves inner products and norms.
+                            cos_v = torch.nn.functional.cosine_similarity(a, b, dim=-1)
+                            repa_loss_vec += scatter_mean(-cos_v, mask, dim=0,
+                                                          dim_size=batch_size)
+
+                            if self.repa_debug and aligned_idx == 0:
+                                with torch.no_grad():
+                                    vp_frob = a.norm(dim=-1)
+                                    vr_frob = b.norm(dim=-1)
+                                    repa_debug_info.update({
+                                        'dbg_vproj_frob_mean': vp_frob.mean().item(),
+                                        'dbg_vproj_frob_std': vp_frob.std().item(),
+                                        'dbg_vrep_frob_mean': vr_frob.mean().item(),
+                                        'dbg_vrep_frob_std': vr_frob.std().item(),
+                                        'dbg_cos_v_mean': cos_v.mean().item(),
+                                        'dbg_cos_v_std': cos_v.std().item(),
+                                    })
+                        if repa_loss_vec_mag is not None:
+                            # Per-channel L=1 magnitude alignment. Both sides
+                            # are [N, 3, d_rep_vec]; collapsing the spatial axis
+                            # with .norm(dim=-2) is rotation-invariant and gives
+                            # one scalar per (atom, channel). MSE is then averaged
+                            # over channels and over real atoms within each
+                            # sample. d_rep_vec is set to UMA's sphere_channels
+                            # in the config so the channel axes line up 1:1 with
+                            # no extra projection.
+                            vp_norm = v_proj.norm(dim=-2)        # [N, d_rep_vec]
+                            vr_norm = z_rep_l1.norm(dim=-2)      # [N, C]
+                            per_atom_mag = ((vp_norm - vr_norm) ** 2).mean(dim=-1)
+                            repa_loss_vec_mag += scatter_mean(
+                                per_atom_mag, mask, dim=0, dim_size=batch_size)
+                else:
+                    lig_feats = lig_s
+                    if real_w is not None:
+                        lig_feats = lig_feats * real_w
+
+                    if self.embedding_type == 'ligand_invariant_embedding':
+                        z_combined = scatter_add(lig_feats, ligand['mask'], dim=0)
+                    elif self.embedding_type == 'pocket_embedding':
+                        z_combined = scatter_add(poc_s, pocket['mask'], dim=0)
+                    else:
+                        lig_pooled = scatter_add(lig_feats, ligand['mask'], dim=0)
+                        poc_pooled = scatter_add(poc_s, pocket['mask'], dim=0)
+                        z_combined = torch.cat([lig_pooled, poc_pooled], dim=-1)
+                    z_proj = self.repa_projectors[aligned_idx](z_combined)
+                    z_proj = torch.nn.functional.normalize(z_proj, dim=-1)
+                    repa_loss += -(z_proj * z_rep_l0).sum(dim=-1)
+                aligned_idx += 1
+            repa_loss = repa_loss / max(aligned_idx, 1)
+
+            loss = loss_diffusion + self.lambda_repa * repa_loss
+            if vec_on:
+                if repa_loss_vec is not None:
+                    repa_loss_vec = repa_loss_vec / max(aligned_idx, 1)
+                    loss = loss + self.lambda_repa_vec * repa_loss_vec
+                if repa_loss_vec_mag is not None:
+                    repa_loss_vec_mag = repa_loss_vec_mag / max(aligned_idx, 1)
+                    loss = loss + self.lambda_repa_vec_mag * repa_loss_vec_mag
+
         if self.timestep_weights is not None:
             w_t = self.timestep_weights(t).squeeze()
             loss = w_t * loss
@@ -653,6 +1022,7 @@ class DrugFlow(pl.LightningModule):
             'loss_x': loss_x.mean().item(),
             'loss_h': loss_h.mean().item(),
             'loss_e': loss_e.mean().item(),
+            'loss_diffusion': loss_diffusion.mean().item(),
         }
         if self.flexible:
             info['loss_chi'] = loss_chi.mean().item()
@@ -661,6 +1031,19 @@ class DrugFlow(pl.LightningModule):
             info['loss_rot'] = loss_rot.mean().item()
         if self.lambda_clash is not None:
             info['loss_clash'] = loss_clash.mean().item()
+        if repa_loss is not None:
+            info['loss_repa'] = repa_loss.mean().item()
+            info['loss_repa_weighted'] = (self.lambda_repa * repa_loss).mean().item()
+        if repa_loss_vec is not None:
+            info['loss_repa_vec'] = repa_loss_vec.mean().item()
+            info['loss_repa_vec_weighted'] = (self.lambda_repa_vec * repa_loss_vec).mean().item()
+        if repa_loss_vec_mag is not None:
+            info['loss_repa_vec_mag'] = repa_loss_vec_mag.mean().item()
+            info['loss_repa_vec_mag_weighted'] = (
+                self.lambda_repa_vec_mag * repa_loss_vec_mag
+            ).mean().item()
+        if repa_debug_info:
+            info.update(repa_debug_info)
         if self.predict_confidence:
             sigma_x_mol = scatter_mean(pred_ligand['uncertainty_vel'], ligand['mask'], dim=0)
             info['pearson_sigma_x'] = torch.corrcoef(torch.stack([sigma_x_mol.detach(), t.squeeze()]))[0, 1].item()
@@ -678,8 +1061,9 @@ class DrugFlow(pl.LightningModule):
 
     def training_step(self, data, *args):
         ligand, pocket = data['ligand'], data['pocket']
+        embedding = data.get('embedding', None)
         try:
-            loss, info = self.compute_loss(ligand, pocket, return_info=True)
+            loss, info = self.compute_loss(ligand, pocket, return_info=True, embedding=embedding)
         except RuntimeError as e:
             # this is not supported for multi-GPU
             if self.trainer.num_devices < 2 and 'out of memory' in str(e):
@@ -705,12 +1089,14 @@ class DrugFlow(pl.LightningModule):
     def validation_step(self, data, *args):
 
         # Compute the loss N times and average to get a better estimate
+        embedding = data.get('embedding', None)
         loss_list, info_list = [], []
         self.dynamics.train()  # TODO: this is currently necessary to make self-conditioning work
         for _ in range(self.n_loss_per_sample):
             loss, info = self.compute_loss(data['ligand'].copy(),
                                            data['pocket'].copy(),
-                                           return_info=True)
+                                           return_info=True,
+                                           embedding=embedding)
             loss_list.append(loss.item())
             info_list.append(info)
         self.dynamics.eval()
@@ -718,6 +1104,9 @@ class DrugFlow(pl.LightningModule):
             loss = np.mean(loss_list)
             info = {k: np.mean([x[k] for x in info_list]) for k in info_list[0]}
             self.log_metrics({'loss': loss, **info}, 'val', batch_size=len(data['ligand']['size']))
+
+        if self.skip_val_sampling:
+            return {'loss': loss}
 
         # Sample
         rdmols, rdpockets, _ = self.sample(
@@ -739,6 +1128,10 @@ class DrugFlow(pl.LightningModule):
 
     def on_validation_epoch_end(self):
 
+        if self.skip_val_sampling:
+            self.validation_step_outputs.clear()
+            return
+
         outdir = Path(self.outdir, f'epoch_{self.current_epoch}')
 
         rdmols = [m for x in self.validation_step_outputs for m in x['ligands']]
@@ -746,46 +1139,11 @@ class DrugFlow(pl.LightningModule):
         receptors = [r for x in self.validation_step_outputs for r in x['receptor_files']]
         self.validation_step_outputs.clear()
 
-        ligand_atom_types = [atom_encoder[a.GetSymbol()] for m in rdmols for a in m.GetAtoms()]
-        ligand_bond_types = []
-        for m in rdmols:
-            bonds = m.GetBonds()
-            no_bonds = m.GetNumAtoms() * (m.GetNumAtoms() - 1) // 2 - m.GetNumBonds()
-            ligand_bond_types += [bond_encoder['NOBOND']] * no_bonds
-            for b in bonds:
-                ligand_bond_types.append(bond_encoder[b.GetBondType().name])
-
-        tic = time()
-        results = self.analyze_sample(
-            rdmols, ligand_atom_types, ligand_bond_types, receptors=(rdpockets if len(rdpockets) != 0 else None)
-        )
+        results = self._evaluate_samples(rdmols, rdpockets)
         self.log_metrics(results, 'val')
-        print(f'Evaluation took {time() - tic:.2f} seconds')
 
         if (self.current_epoch + 1) % self.visualize_sample_epoch == 0:
-            tic = time()
-
-            outdir.mkdir(exist_ok=True, parents=True)
-
-            # center for better visualization
-            rdmols = rdmols[:self.n_visualize_samples]
-            rdpockets = rdpockets[:self.n_visualize_samples]
-            for m, p in zip(rdmols, rdpockets):
-                center = m.GetConformer().GetPositions().mean(axis=0)
-                for i in range(m.GetNumAtoms()):
-                    x, y, z = m.GetConformer().GetPositions()[i] - center
-                    m.GetConformer().SetAtomPosition(i, (x, y, z))
-                for i in range(p.GetNumAtoms()):
-                    x, y, z = p.GetConformer().GetPositions()[i] - center
-                    p.GetConformer().SetAtomPosition(i, (x, y, z))
-
-            # save molecule
-            utils.write_sdf_file(Path(outdir, 'molecules.sdf'), rdmols)
-
-            # save pocket
-            utils.write_sdf_file(Path(outdir, 'pockets.sdf'), rdpockets)
-
-            print(f'Sample visualization took {time() - tic:.2f} seconds')
+            self._save_sample_visualizations(rdmols, rdpockets, outdir)
 
         if (self.current_epoch + 1) % self.visualize_chain_epoch == 0:
             tic = time()
@@ -839,6 +1197,86 @@ class DrugFlow(pl.LightningModule):
             self.log_metrics(info, 'val')
             print(f'Chain visualization took {time() - tic:.2f} seconds')
 
+    def _evaluate_samples(self, rdmols, rdpockets):
+        """Run analyze_sample on accumulated samples. Returns a dict of metric
+        name -> value (without the `val/` prefix). Shared by the in-training
+        `on_validation_epoch_end` and the offline `run_offline_evaluation`.
+        """
+        ligand_atom_types = [atom_encoder[a.GetSymbol()] for m in rdmols for a in m.GetAtoms()]
+        ligand_bond_types = []
+        for m in rdmols:
+            bonds = m.GetBonds()
+            no_bonds = m.GetNumAtoms() * (m.GetNumAtoms() - 1) // 2 - m.GetNumBonds()
+            ligand_bond_types += [bond_encoder['NOBOND']] * no_bonds
+            for b in bonds:
+                ligand_bond_types.append(bond_encoder[b.GetBondType().name])
+
+        tic = time()
+        results = self.analyze_sample(
+            rdmols, ligand_atom_types, ligand_bond_types,
+            receptors=(rdpockets if len(rdpockets) != 0 else None),
+        )
+        print(f'Evaluation took {time() - tic:.2f} seconds')
+        return results
+
+    def _save_sample_visualizations(self, rdmols, rdpockets, outdir):
+        """Centre the first N samples and write `molecules.sdf` + `pockets.sdf`
+        into `outdir`. Shared by in-training and offline evaluation paths.
+        """
+        tic = time()
+        outdir = Path(outdir)
+        outdir.mkdir(exist_ok=True, parents=True)
+
+        rdmols = rdmols[:self.n_visualize_samples]
+        rdpockets = rdpockets[:self.n_visualize_samples]
+        for m, p in zip(rdmols, rdpockets):
+            center = m.GetConformer().GetPositions().mean(axis=0)
+            for i in range(m.GetNumAtoms()):
+                x, y, z = m.GetConformer().GetPositions()[i] - center
+                m.GetConformer().SetAtomPosition(i, (x, y, z))
+            for i in range(p.GetNumAtoms()):
+                x, y, z = p.GetConformer().GetPositions()[i] - center
+                p.GetConformer().SetAtomPosition(i, (x, y, z))
+
+        utils.write_sdf_file(Path(outdir, 'molecules.sdf'), rdmols)
+        utils.write_sdf_file(Path(outdir, 'pockets.sdf'), rdpockets)
+        print(f'Sample visualization took {time() - tic:.2f} seconds')
+
+    @torch.no_grad()
+    def run_offline_evaluation(self, dataloader=None, outdir=None, visualize=True, split='val'):
+        """Run the expensive validation pipeline (sampling + analyze_sample + SDF
+        visualization) outside of Lightning's fit loop. Used by src/validate.py.
+
+        Returns a dict of metric name -> value (without the `{split}/` prefix).
+        """
+        self.eval()
+        if dataloader is None:
+            dataloader = self.val_dataloader() if split == 'val' else self.test_dataloader()
+        device = next(self.parameters()).device
+
+        rdmols_all, rdpockets_all, receptors_all = [], [], []
+        for data in tqdm(dataloader, desc='sampling'):
+            data_on_device = {
+                'ligand': TensorDict(**data['ligand']).to(device),
+                'pocket': Residues(**data['pocket']).to(device),
+            }
+            rdmols, rdpockets, _ = self.sample(
+                data=data_on_device,
+                n_samples=self.n_eval_samples,
+                num_nodes='ground_truth' if self.sample_with_ground_truth_size else None,
+            )
+            rdmols_all.extend(rdmols)
+            rdpockets_all.extend(rdpockets)
+            receptors_all.extend(
+                [Path(self.receptor_dir, split, x) for x in data['pocket']['name']]
+            )
+
+        results = self._evaluate_samples(rdmols_all, rdpockets_all)
+
+        if visualize and outdir is not None and len(rdmols_all) > 0:
+            self._save_sample_visualizations(rdmols_all, rdpockets_all, outdir)
+
+        return results
 
     # NOTE: temporary fix of this Lightning bug:
     # https://github.com/Lightning-AI/pytorch-lightning/discussions/18110
@@ -958,7 +1396,7 @@ class DrugFlow(pl.LightningModule):
         agg_results = aggregated_metrics(results, self.evaluator.dtypes, VALIDITY_METRIC_NAME).fillna(0)
         agg_results['metric'] = agg_results['metric'].str.replace('.', '/')
 
-        col_results = collection_metrics(results, self.train_smiles, VALIDITY_METRIC_NAME, exclude_evaluators='fcd')
+        col_results = collection_metrics(results, self.train_smiles, VALIDITY_METRIC_NAME)
         col_results['metric'] = 'collection/' + col_results['metric']
 
         all_results = pd.concat([agg_results, col_results])

@@ -69,7 +69,7 @@ def collate_entity(batch):
     out = {}
     for prop in batch[0].keys():
 
-        if prop == 'name':
+        if prop in {'name', 'complex_id'}:
             out[prop] = [x[prop] for x in batch]
 
         elif prop == 'size' or prop == 'n_bonds':
@@ -83,7 +83,7 @@ def collate_entity(batch):
         elif prop == 'residues':
             out[prop] = list(chain.from_iterable(x[prop] for x in batch))
 
-        elif prop in {'mask', 'bond_mask'}:
+        elif prop in {'mask', 'bond_mask', 'uma_atoms_count_match', 'uma_atoms_in_order'}:
             pass  # batch masks will be written later
 
         else:
@@ -108,7 +108,7 @@ def split_entity(
         index_types={'bonds'}, 
         edge_types={'bond_one_hot', 'bond_mask'}, 
         no_split={'name', 'size', 'n_bonds'}, 
-        skip={'fragments'},
+        skip={'fragments', 'uma_atoms_count_match', 'uma_atoms_in_order', 'complex_id'},
         batch_mask=None, 
         edge_mask=None
     ):
@@ -851,7 +851,8 @@ class Residues(TensorDict):
     def center(self):
         com = scatter_mean(self['x'], self['mask'], dim=0)
         self['x'] = self['x'] - com[self['mask']]
-        self['fixed_coord'] = self['fixed_coord'] - com[self['mask']].unsqueeze(1)
+        if 'fixed_coord' in self:
+            self['fixed_coord'] = self['fixed_coord'] - com[self['mask']].unsqueeze(1)
         return com
 
     def set_empty_v(self):

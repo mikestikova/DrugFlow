@@ -1,4 +1,4 @@
-run_name: drugflow # iclr_drugflow_T5000
+run_name: drugflow_baseline
 pocket_representation: CA+
 virtual_nodes: [0, 10]
 flexible: False
@@ -7,13 +7,14 @@ flexible_bb: False
 train_params:
   logdir: ./runs # symlink to any location you like
   datadir: ./processed_crossdocked # symlink to the dataset location
+  dataset_suffix: '.with_uma' # load the complex_id-augmented splits (train.with_uma.pt)
   enable_progress_bar: True
   num_sanity_val_steps: 0
   batch_size: 64
   accumulate_grad_batches: 2
   lr: 5.0e-4
   n_epochs: 1000
-  num_workers: 0
+  num_workers: 4
   gpus: 1
   clip_grad: True
   gnina: gnina
@@ -44,13 +45,17 @@ simulation_params:
   predict_confidence: False
 
 eval_params:
-  eval_epochs: 100
-  n_eval_samples: 4
+  # Periodic-checkpoint callback fires only when skip_val_sampling is True
+  # (see src/train.py line ~217). With eval_epochs=10 a checkpoint lands
+  # under runs_iclr/<run_name>/checkpoints/periodic/ every 10 epochs.
+  skip_val_sampling: True
+  eval_epochs: 10
+  n_eval_samples: 4 
   n_sampling_steps: 500
   eval_batch_size: 16
-  visualize_sample_epoch: 1
+  visualize_sample_epoch: 10
   n_visualize_samples: 100
-  visualize_chain_epoch: 1
+  visualize_chain_epoch: 10
   keep_frames: 100
   sample_with_ground_truth_size: True
 

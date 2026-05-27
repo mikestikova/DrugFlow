@@ -1,19 +1,20 @@
-run_name: drugflow_no_virtual_nodes # iclr_drugflow_T5000_no_virtual_nodes
+run_name: drugflow_repa_ema
 pocket_representation: CA+
-virtual_nodes: null
+virtual_nodes: [0, 10]
 flexible: False
 flexible_bb: False
 
 train_params:
-  logdir: ./runs # symlink to any location you like
-  datadir: ./processed_crossdocked # symlink to the dataset location
+  logdir: ./runs
+  datadir: ./processed_crossdocked
+  dataset_suffix: '.with_uma' # load the complex_id-augmented splits (train.with_uma.pt)
   enable_progress_bar: True
   num_sanity_val_steps: 0
   batch_size: 64
   accumulate_grad_batches: 2
   lr: 5.0e-4
-  n_epochs: 1000
-  num_workers: 0
+  n_epochs: 600
+  num_workers: 4
   gpus: 1
   clip_grad: True
   gnina: gnina
@@ -21,12 +22,12 @@ train_params:
   sharded_dataset: False
 
 wandb_params:
-  mode: online  # disabled, offline, online
-  entity: lpdi
-  group: crossdocked
+  mode: online
+  entity:
+  group: phase_3
 
 loss_params:
-  discrete_loss: VLB  # VLB or CE
+  discrete_loss: VLB
   lambda_x: 1.0
   lambda_h: 50.0
   lambda_e: 50.0
@@ -35,22 +36,38 @@ loss_params:
   lambda_rot: null
   lambda_clash: null
   timestep_weights: null
+  # REPA: atom-level L=0 + L=1 with the heavy projectors — MLP for scalars,
+  # GVP (vector-gated) for vectors. The "maximal expressivity" setting.
+  rep_alignment: True
+  lambda_repa: 1.0
+  lambda_repa_vec: 1.0
+  align_depth: [3]
+  d_rep: 128
+  d_rep_vec: 128
+  projector_dim: 512
+  projector_style: mlp
+  projector_vec_style: gvp
+  projector_bn: false
+  embeddings_dir: /mnt/datasets/CrossDocked/embeddings_hydrogens_uma_s_depth_2
+  embedding_type: atom_ligand
+  embedding_key: l0_l1
 
 simulation_params:
   n_steps: 5000
-  prior_h: marginal # uniform, marginal
-  prior_e: uniform # uniform, marginal
+  prior_h: marginal
+  prior_e: uniform
   predict_final: False
   predict_confidence: False
 
 eval_params:
-  eval_epochs: 100
+  skip_val_sampling: True
+  eval_epochs: 10
   n_eval_samples: 4
   n_sampling_steps: 500
   eval_batch_size: 16
-  visualize_sample_epoch: 1
+  visualize_sample_epoch: 10
   n_visualize_samples: 100
-  visualize_chain_epoch: 1
+  visualize_chain_epoch: 10
   keep_frames: 100
   sample_with_ground_truth_size: True
 
@@ -76,7 +93,10 @@ predictor_params:
 
   gvp_params:
     n_layers: 5
-    node_h_dim: [ 128, 32 ]  # (s, V)
+    node_h_dim: [ 128, 32 ]
     edge_h_dim: [ 128, 32 ]
     dropout: 0.0
     vector_gate: True
+
+ema:
+  decay: 0.999
