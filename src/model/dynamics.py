@@ -159,7 +159,8 @@ class DynamicsBase(nn.Module):
 
     @abstractmethod
     def _forward(self, x_atoms, h_atoms, mask_atoms, pocket, t, bonds_ligand=None,
-                 h_atoms_sc=None, e_atoms_sc=None, h_residues_sc=None):
+                 h_atoms_sc=None, e_atoms_sc=None, h_residues_sc=None,
+                 return_intermediates=False):
         """
         Implement forward pass.
         Returns:
@@ -203,7 +204,8 @@ class DynamicsBase(nn.Module):
 
         return h_atoms_sc, e_atoms_sc, h_residues_sc
 
-    def forward(self, x_atoms, h_atoms, mask_atoms, pocket, t, bonds_ligand=None, sc_transform=None):
+    def forward(self, x_atoms, h_atoms, mask_atoms, pocket, t, bonds_ligand=None,
+                sc_transform=None, return_intermediates=False):
         """
         Implements self-conditioning as in https://arxiv.org/abs/2208.04202
         """
@@ -253,15 +255,22 @@ class DynamicsBase(nn.Module):
             h_atoms_sc, e_atoms_sc, h_residues_sc = self.make_sc_input(
                 self.prev_ligand, self.prev_residues, sc_transform)
 
-        pred_ligand, pred_residues = self._forward(
+        result = self._forward(
             x_atoms, h_atoms, mask_atoms, pocket, t, bonds_ligand,
-            h_atoms_sc, e_atoms_sc, h_residues_sc
+            h_atoms_sc, e_atoms_sc, h_residues_sc,
+            return_intermediates=return_intermediates
         )
+        if return_intermediates:
+            pred_ligand, pred_residues, intermediates = result
+        else:
+            pred_ligand, pred_residues = result
 
         if self.self_conditioning and not self.training:
             self.prev_ligand = pred_ligand.copy()
             self.prev_residues = pred_residues.copy()
 
+        if return_intermediates:
+            return pred_ligand, pred_residues, intermediates
         return pred_ligand, pred_residues
 
     def compute_extra_features(self, batch_mask, edge_indices, edge_types):
@@ -536,7 +545,8 @@ class Dynamics(DynamicsBase):
         self.condition_time = condition_time
 
     def _forward(self, x_atoms, h_atoms, mask_atoms, pocket, t, bonds_ligand=None,
-                h_atoms_sc=None, e_atoms_sc=None, h_residues_sc=None):
+                h_atoms_sc=None, e_atoms_sc=None, h_residues_sc=None,
+                return_intermediates=False):
         """
         :param x_atoms:
         :param h_atoms:

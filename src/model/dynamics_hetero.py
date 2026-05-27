@@ -445,7 +445,7 @@ class GVPModel(torch.nn.Module):
             ('pocket', '', 'ligand'): GVP(edge_h_dim_interaction, edge_out_dim_interaction, activations=(None, None), vector_gate=vector_gate) if edge_out_dim_interaction is not None else None,
         })
 
-    def forward(self, node_attr, batch_mask, edge_index, edge_attr):
+    def forward(self, node_attr, batch_mask, edge_index, edge_attr, return_intermediates=False):
 
         # to hidden dimension
         for k in node_attr.keys():
@@ -455,12 +455,21 @@ class GVPModel(torch.nn.Module):
             edge_attr[k] = self.edge_in[k](edge_attr[k])
 
         # convolutions
+        intermediates = []
         for layer in self.layers:
             out = layer(node_attr, edge_index, edge_attr)
             if self.update_edge_attr:
                 node_attr, edge_attr = out
             else:
                 node_attr = out
+
+            if return_intermediates:
+                # Capture both GVP halves so downstream REPA losses can
+                # align scalars (L=0) and/or the vector part (L=1).
+                intermediates.append({
+                    k: {'scalar': v[0], 'vector': v[1]}
+                    for k, v in node_attr.items()
+                })
 
         # to output dimension
         for k in node_attr.keys():
@@ -472,6 +481,8 @@ class GVPModel(torch.nn.Module):
                 if self.edge_out[k] is not None:
                     edge_attr[k] = self.edge_out[k](edge_attr[k])
 
+        if return_intermediates:
+            return node_attr, edge_attr, intermediates
         return node_attr, edge_attr
 
 
@@ -661,7 +672,8 @@ class DynamicsHetero(DynamicsBase):
             raise NotImplementedError(f"Angle activation {angle_act_fn} not available")
 
     def _forward(self, x_atoms, h_atoms, mask_atoms, pocket, t, bonds_ligand=None,
-                 h_atoms_sc=None, e_atoms_sc=None, h_residues_sc=None):
+                 h_atoms_sc=None, e_atoms_sc=None, h_residues_sc=None,
+                 return_intermediates=False):
         """
         :param x_atoms:
         :param h_atoms:
@@ -762,8 +774,13 @@ class DynamicsHetero(DynamicsBase):
             batch_mask_dict = {'ligand': mask_atoms}
 
         if self.model == 'gvp' or self.model == 'gvp_transformer':
-            out_node_attr, out_edge_attr = self.net(
-                node_attr_dict, batch_mask_dict, edge_index_dict, edge_attr_dict)
+            net_result = self.net(
+                node_attr_dict, batch_mask_dict, edge_index_dict, edge_attr_dict,
+                return_intermediates=return_intermediates)
+            if return_intermediates:
+                out_node_attr, out_edge_attr, intermediates = net_result
+            else:
+                out_node_attr, out_edge_attr = net_result
 
         else:
             raise NotImplementedError(f"Wrong model ({self.model})")
@@ -785,7 +802,7 @@ class DynamicsHetero(DynamicsBase):
         # Symmetrize
         edge_logits = torch.zeros(
             (len(mask_atoms), len(mask_atoms), edge_final.size(-1)),
-            device=mask_atoms.device)
+            device=mask_atoms.device, dtype=edge_final.dtype)
         edge_logits[edges[0], edges[1]] = edge_final
         edge_logits = (edge_logits + edge_logits.transpose(0, 1)) * 0.5
 
@@ -822,6 +839,8 @@ class DynamicsHetero(DynamicsBase):
         if self.angle_act_fn is not None and 'chi' in pred_residues:
             pred_residues['chi'] = self.angle_act_fn(pred_residues['chi'])
 
+        if return_intermediates:
+            return pred_ligand, pred_residues, intermediates
         return pred_ligand, pred_residues
 
     def get_edges(self, x_ligand, h_ligand, batch_mask_ligand, edges_ligand, edge_feat_ligand,

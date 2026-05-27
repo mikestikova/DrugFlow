@@ -14,7 +14,17 @@ sys.path.append(str(basedir))
 
 from src.model.lightning import DrugFlow
 from src.model.dpo import DPO
+from src.model.ema import EMACallback
 from src.utils import set_deterministic, disable_rdkit_logging, dict_to_namespace, namespace_to_dict
+
+class PeriodicCheckpoint(pl.callbacks.ModelCheckpoint):
+    """Marker subclass so the periodic-snapshot callback's state_key differs
+    from the default ``last.ckpt`` ModelCheckpoint. Lightning requires unique
+    state_keys among stateful callbacks of the same type, and when
+    ``eval_epochs == 1`` the two callbacks would otherwise collide on
+    ``every_n_epochs=1``.
+    """
+    pass
 
 
 def merge_args_and_yaml(args, config_dict):
@@ -105,6 +115,9 @@ if __name__ == "__main__":
         print('OVERFITTING MODE')
 
     args.eval_params.outdir = out_dir
+    # Mirror of DrugFlow.skip_val_sampling / DPO's override, so train.py can
+    # decide which callbacks to attach without instantiating the model.
+    skip_val_sampling = (not args.dpo_mode) and getattr(args.eval_params, 'skip_val_sampling', True)
     model_class = DPO if args.dpo_mode else DrugFlow
     model_args = {
         'pocket_representation': args.pocket_representation,
@@ -135,7 +148,7 @@ if __name__ == "__main__":
     
     logger = pl.loggers.WandbLogger(
         save_dir=args.train_params.logdir,
-        project='FlexFlow',
+        project='UMAFlow',
         group=args.wandb_params.group,
         name=args.run_name,
         id=args.run_name,
@@ -158,7 +171,42 @@ if __name__ == "__main__":
             mode="min",
             auto_insert_metric_name=False,
         ),
+
+        # When in-training sampling is skipped (see DrugFlow.skip_val_sampling),
+        # full evaluation is deferred to src/validate.py run offline. Keep a
+        # snapshot at every old validation cadence for that script to consume.
+        # Subclass is used so its state_key differs from the `last.ckpt`
+        # callback above when `eval_epochs == 1` (Lightning requires unique
+        # state_keys among stateful callbacks of the same type).
+        PeriodicCheckpoint(
+            dirpath=Path(checkpoints_root_dir, 'periodic'),
+            filename="epoch_{epoch:04d}",
+            every_n_epochs=args.eval_params.eval_epochs,
+            save_top_k=-1,
+            auto_insert_metric_name=False,
+        ),
     ]
+    checkpoint_callbacks = [cb for cb in checkpoint_callbacks if cb is not None]
+
+    # EMA of weights (opt-in via `ema:` section in the config).
+    # Only enabled for non-DPO training; DPO already uses a frozen reference
+    # model and mixing EMA on top has not been vetted.
+    ema_cfg = getattr(args, 'ema', None)
+    ema_callback = None
+    if ema_cfg is not None and not args.dpo_mode:
+        assert hasattr(ema_cfg, 'decay'), \
+            "ema.decay is required when the `ema` config section is present"
+        ema_callback = EMACallback(
+            decay=ema_cfg.decay,
+            start_step=getattr(ema_cfg, 'start_step', 0),
+            update_every_n_steps=getattr(ema_cfg, 'update_every_n_steps', 1),
+            include_buffers=getattr(ema_cfg, 'include_buffers', False),
+        )
+        print(f'EMA enabled (decay={ema_cfg.decay}, '
+              f'start_step={getattr(ema_cfg, "start_step", 0)}, '
+              f'update_every_n_steps={getattr(ema_cfg, "update_every_n_steps", 1)})')
+    elif ema_cfg is not None and args.dpo_mode:
+        print('EMA config present but ignored in DPO mode.')
 
     # For learning rate logging
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='step')
@@ -167,7 +215,7 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         max_epochs=args.train_params.n_epochs,
         logger=logger,
-        callbacks=checkpoint_callbacks + [lr_monitor],
+        callbacks=checkpoint_callbacks + [lr_monitor] + ([ema_callback] if ema_callback is not None else []),
         enable_progress_bar=args.train_params.enable_progress_bar,
         check_val_every_n_epoch=args.eval_params.eval_epochs,
         num_sanity_val_steps=args.train_params.num_sanity_val_steps,
