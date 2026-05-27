@@ -7,7 +7,7 @@ flexible_bb: False
 train_params:
   logdir: ./runs # symlink to any location you like
   datadir: ./processed_crossdocked # symlink to the dataset location
-  dataset_suffix: '.with_uma' # load the complex_id-augmented splits (train.with_uma.pt)
+  dataset_suffix: '' # load the original splits (train.pt)
   enable_progress_bar: True
   num_sanity_val_steps: 0
   batch_size: 64

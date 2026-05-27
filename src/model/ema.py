@@ -8,15 +8,19 @@ Usage: add an `ema` section to the training YAML config, e.g.:
       update_every_n_steps: 1  # optional, defaults to 1
       include_buffers: False   # optional, defaults to False
 
-During validation (and therefore during ModelCheckpoint callbacks that fire on
-validation end) the EMA shadow weights are swapped into the LightningModule, so
-validation metrics and saved checkpoints reflect the EMA model. The live
-weights are restored at the start of the next training epoch, so training
-continues from the true trajectory.
+During validation the EMA shadow weights are swapped into the LightningModule
+so validation metrics reflect the EMA model, then the live weights are restored
+at ``on_validation_end`` -- *before* any ``ModelCheckpoint`` runs (PyTorch
+Lightning reorders Checkpoint callbacks to run last among callbacks). As a
+result **every saved checkpoint contains the live training weights**, while the
+EMA weights live only in this callback's state dict (the ``shadow``). Resuming
+therefore continues from the true training trajectory, and the EMA shadow
+travels alongside it.
 
-Checkpoints saved at train-epoch end (e.g. ``last.ckpt``) still contain the
-live weights; the EMA shadow travels alongside them as part of this callback's
-state dict, so resuming from ``last.ckpt`` restores both.
+To evaluate or deploy the EMA model, load a checkpoint and swap the shadow into
+the module -- see ``apply_ema`` in ``src/sample_and_evaluate.py`` and
+``apply_ema_shadow`` in ``scripts/python/run_validate_checkpoint.py``, which
+both reconstruct a callback from the saved ``shadow`` and call ``_swap_in``.
 """
 
 from typing import Optional
@@ -29,11 +33,11 @@ class EMACallback(pl.Callback):
     """Maintains an exponential moving average of module parameters.
 
     The shadow is updated after every optimizer step (honouring gradient
-    accumulation via ``trainer.global_step``). During validation the shadow
-    is loaded into the module so any ``ModelCheckpoint`` firing on
-    ``on_validation_end`` saves the EMA weights. The live weights are put
-    back at the start of the next training epoch, so the training trajectory
-    is unaffected.
+    accumulation via ``trainer.global_step``). During validation the shadow is
+    loaded into the module so validation metrics reflect the EMA model, and the
+    live weights are restored at ``on_validation_end`` before any
+    ``ModelCheckpoint`` runs. Saved checkpoints therefore always contain the
+    live weights; the EMA weights are kept only in this callback's state dict.
     """
 
     def __init__(
@@ -135,16 +139,26 @@ class EMACallback(pl.Callback):
         self._update(pl_module)
 
     def on_validation_start(self, trainer, pl_module):
-        # Swap shadow weights into the module so validation metrics and any
-        # ModelCheckpoint firing at on_validation_end see the EMA model.
-        # NOTE: we intentionally DO NOT swap out in on_validation_end because
-        # PyTorch Lightning reorders Checkpoint callbacks to run last among
-        # callbacks at on_validation_end -- swapping out there would restore
-        # live weights before the checkpoint is saved.
+        # Swap shadow weights into the module so validation metrics reflect the
+        # EMA model. They are restored in on_validation_end (below), before any
+        # checkpoint is written.
         self._swap_in(pl_module)
 
+    def on_validation_end(self, trainer, pl_module):
+        # Restore the live weights *before* any ModelCheckpoint saves. PyTorch
+        # Lightning reorders Checkpoint callbacks to run last among callbacks at
+        # on_validation_end (see _CallbackConnector._reorder_callbacks), and this
+        # is an ordinary ("other") callback that runs before them. So checkpoints
+        # saved here -- and `last.ckpt`, saved later at on_train_epoch_end --
+        # capture the live weights, not the EMA shadow. The validation metrics
+        # logged above were already computed on the EMA model.
+        self._swap_out(pl_module)
+
     def on_train_epoch_start(self, trainer, pl_module):
-        # Restore live weights for training. Safe to call when EMA isn't active.
+        # Defensive: live weights are normally already restored in
+        # on_validation_end, so this is a no-op. Kept to guarantee training
+        # resumes on live weights even if a validation run was interrupted
+        # before its end hook fired.
         self._swap_out(pl_module)
 
     def on_sanity_check_end(self, trainer, pl_module):

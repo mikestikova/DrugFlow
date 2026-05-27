@@ -51,12 +51,6 @@ class ProcessedLigandPocketDataset(Dataset):
         # name-derived stem with an rglob-built index, which is much slower to
         # initialise on large embedding sets.
         self.has_complex_id = 'complex_id' in self.data['ligands']
-        if not self.has_complex_id:
-            raise ValueError(
-                "Dataset is missing 'complex_id' keys for ligands. "
-                "Please regenerate your dataset with `complex_id` included, "
-                "or switch to an older dataset version that includes them."
-            )
         if embeddings_dir is not None:
             self.embeddings_dir = Path(embeddings_dir)
         else:

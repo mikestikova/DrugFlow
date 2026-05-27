@@ -148,7 +148,7 @@ if __name__ == "__main__":
     
     logger = pl.loggers.WandbLogger(
         save_dir=args.train_params.logdir,
-        project='FlexFlow',
+        project='UMAFlow',
         group=args.wandb_params.group,
         name=args.run_name,
         id=args.run_name,

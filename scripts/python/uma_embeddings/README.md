@@ -12,7 +12,7 @@ build_uma_complex_id_mapping.py     verify_uma_atom_order.py
         │                                       │
         ▼                                       ▼
   processed_crossdocked/             "Atom-order aligned: YES"
-  {train,val,test}.with_uma.pt
+  {train,val}.with_uma.pt
         │
         ▼
   dataset loader at training time
@@ -31,17 +31,16 @@ back with a per-ligand `complex_id` field (a positional list parallel to
 `ligands["name"]`) plus a `uma_meta` block of provenance + per-split match
 stats.
 
-The command used to build the train split (writes
-`processed_crossdocked/train.with_uma.pt` next to the input):
+Build the **train and val** splits (writes `train.with_uma.pt` and
+`val.with_uma.pt` next to the inputs). The **test** split is intentionally
+left plain — it goes through `model.sample()` and never computes the REPA
+loss, so it needs no embeddings:
 
 ```bash
 python scripts/python/uma_embeddings/build_uma_complex_id_mapping.py \
-  --splits processed_crossdocked/train.pt \
+  --splits processed_crossdocked/train.pt processed_crossdocked/val.pt \
   --embeddings-dir /mnt/datasets/CrossDocked/embeddings_hydrogens_uma_s_depth_2
 ```
-
-Pass several splits to build them in one run, e.g.
-`--splits processed_crossdocked/train.pt processed_crossdocked/val.pt processed_crossdocked/test.pt`.
 
 Flags:
 - `--in-place` — overwrite each input split instead of writing a
@@ -57,7 +56,9 @@ Flags:
 
 The augmented splits are consumed at training time via
 `train_params.dataset_suffix: '.with_uma'`, which makes the loader read
-`{stage}.with_uma.pt`.
+`{stage}.with_uma.pt` for the train and val splits (test always loads the
+plain `test.pt`; see `_split_pt_path` / `_uses_dataset_suffix` in
+`src/model/lightning.py`).
 
 ## 2. Verify atom-order alignment for a specific source
 

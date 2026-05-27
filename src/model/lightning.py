@@ -146,9 +146,11 @@ class DrugFlow(pl.LightningModule):
         self.datadir = train_params.datadir
         self.receptor_dir = train_params.datadir
         # Optional `train_params.dataset_suffix: '.with_uma'` switches the
-        # loader to `{stage}.with_uma.pt`. The `.with_uma` files include
-        # `complex_id` for direct embedding-path lookup; legacy `{stage}.pt`
-        # files don't. Default empty string preserves the old behaviour.
+        # loader to `{stage}.with_uma.pt` for the train and val splits (test
+        # always loads plain `test.pt`; see `_split_pt_path`). The `.with_uma`
+        # files include `complex_id` for direct embedding-path lookup; legacy
+        # `{stage}.pt` files don't. Default empty string preserves the old
+        # behaviour.
         self.dataset_suffix = getattr(train_params, 'dataset_suffix', '')
         self.batch_size = train_params.batch_size
         self.lr = train_params.lr
@@ -495,6 +497,25 @@ class DrugFlow(pl.LightningModule):
         else:
             raise NotImplementedError
 
+    def _uses_dataset_suffix(self, stage):
+        """Whether `dataset_suffix` (e.g. '.with_uma') applies to `stage`.
+
+        Applies to the train and val splits — the ones whose complex_id-
+        augmented `.with_uma.pt` versions are generated and which therefore
+        carry REPA embeddings. test always loads the plain `test.pt` (it goes
+        through model.sample(), never computes loss, and OOD eval may lack the
+        embeddings dir). Debug loads the val split for every stage, so it
+        follows the val rule. REPA embeddings load under this same condition.
+        """
+        base = 'val' if self.debug else stage
+        return base != 'test'
+
+    def _split_pt_path(self, stage):
+        """Path to the split `.pt` for `stage` (see `_uses_dataset_suffix`)."""
+        base = 'val' if self.debug else stage
+        suffix = self.dataset_suffix if self._uses_dataset_suffix(stage) else ''
+        return Path(self.datadir, f'{base}{suffix}.pt')
+
     def get_dataset(self, stage, pocket_transform=None):
 
         # when sampling we don't append virtual nodes as we might need access to the ground truth size
@@ -507,15 +528,16 @@ class DrugFlow(pl.LightningModule):
         # we want to know if something goes wrong on the validation or test set
         catch_errors = stage == "train"
 
-        # Resolve embeddings directory for REPA (per-complex .pt files).
-        # REPA targets are only consumed by compute_loss (training_step +
-        # validation_step). The test stage goes through model.sample() and
-        # never computes loss, so loading embeddings there is wasted work
-        # and breaks OOD eval where the embedding dir doesn't exist.
+        # Resolve embeddings directory for REPA (per-complex .pt files), for
+        # the train and val splits — the ones with a `.with_uma.pt` version
+        # carrying per-ligand `complex_id`. test loads plain `test.pt` without
+        # embeddings: it goes through model.sample(), never computes loss, and
+        # OOD eval may lack the embeddings dir (compute_loss skips REPA when
+        # `embedding` is None, so test just gets the diffusion loss).
         embeddings_dir = None
         embedding_type = 'ligand_invariant_embedding'
         embedding_key = None
-        if self.rep_alignment and self.embeddings_dir is not None and stage != "test":
+        if self.rep_alignment and self.embeddings_dir is not None and self._uses_dataset_suffix(stage):
             embeddings_dir = self.embeddings_dir
             embedding_type = self.embedding_type
             embedding_key = self.embedding_key
@@ -530,11 +552,7 @@ class DrugFlow(pl.LightningModule):
 
         if self.sample_from_clusters and stage == "train":  # val/test should be deterministic
             return ClusteredDataset(
-                pt_path=Path(
-                self.datadir,
-                f'val{self.dataset_suffix}.pt' if self.debug
-                else f'{stage}{self.dataset_suffix}.pt',
-            ),
+                pt_path=self._split_pt_path(stage),
                 ligand_transform=ligand_transform,
                 pocket_transform=pocket_transform,
                 catch_errors=catch_errors,
@@ -544,11 +562,7 @@ class DrugFlow(pl.LightningModule):
             )
 
         return ProcessedLigandPocketDataset(
-            pt_path=Path(
-                self.datadir,
-                f'val{self.dataset_suffix}.pt' if self.debug
-                else f'{stage}{self.dataset_suffix}.pt',
-            ),
+            pt_path=self._split_pt_path(stage),
             ligand_transform=ligand_transform,
             pocket_transform=pocket_transform,
             catch_errors=catch_errors,
