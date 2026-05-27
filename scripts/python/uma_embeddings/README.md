@@ -109,12 +109,3 @@ Row layout of `x` and `atom_embeddings`:
 [n_pocket+n_ligand : ... + n_pocket_h )   pocket H
 [...                                   )   ligand H
 ```
-
-## Other scripts (diagnostics, not part of the main pipeline)
-
-- `check_uma_target_stats.py` — pre-experiment go/no-go: does an
-  embedding source have non-trivial signal for L=0 cosine and L=1
-  alignment? Pure analysis, no DrugFlow side.
-- `verify_uma_sh_convention.py` — one-off investigation of UMA's L=1
-  spherical-harmonic axis convention. Result: slots are already
-  Cartesian (x, y, z); no permutation needed.
