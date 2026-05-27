@@ -104,7 +104,7 @@ todo
 > *Placeholder — to do, provide links to sampled datasets on Zenodo or elsewhere.*
 
 
-### Sampling for all proteins in the test set TODO
+### Sampling for all proteins in the test set
 
 Select checkpoint, e.g. `checkpoints/drugflow.ckpt`, and specify it in `configs/sampling/sample_and_maybe_evaluate.yml`.
 
@@ -121,9 +121,9 @@ python src/sample_and_evaluate.py --config configs/sampling/sample_and_maybe_eva
 which supports parallelization across target pockets by specifying `--job_id` and `--n_jobs`.
 To also evaluate the results, set `evaluate: True` in the sampling config file.
 
-### Evaluating samples  TODO
+### Evaluating samples
 
-We provide evaluators for metrics used in our paper. To evaluate samples, specify:
+To evaluate samples, specify:
 
 ```bash
 SAMPLES_DIR=...  # Location where the sampled dataset is stored
@@ -145,7 +145,8 @@ python scripts/python/postprocess_metrics.py \
 Per-sample evaluation results will be stored in ```EVALUATED_DATA/metrics_detailed.csv``` and aggregated metrics will be stored in ```EVALUATED_DATA/metrics_aggregated.csv```.
 
 
-## OOD evaluation on Runs-N-Poses TODO
+## OOD evaluation on Runs-N-Poses 
+> *Placeholder — to do, provide instructions for reproducing the OOD evaluation on the Runs-N-Poses subset, including links to the subset and any necessary checkpoints or sampled datasets.*
 Dataset: **Runs-N-Poses** (hardest subset) — 95 targets reduced to 68 after removing redundant pockets and ion-containing complexes. Used for out-of-distribution evaluation.
 
 

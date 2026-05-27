@@ -7,7 +7,7 @@ device: cuda
 seed: 42
 sample: True
 postprocess: False
-evaluate: False
+evaluate: True
 reduce: reduce
 
 # Override training config parameters if necessary
